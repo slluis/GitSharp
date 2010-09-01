@@ -110,8 +110,9 @@ namespace GitSharp.Core.Merge
                 // the lines with conflict-metadata are written. Now write the chunk
                 for (int i = chunk.getBegin(); i < chunk.getEnd(); i++)
                 {
+					if (i > 0)
+						@out.Write('\n');
                     seq.writeLine(@out.BaseStream, i);
-                    @out.Write('\n');
 
                 }
             }
@@ -119,6 +120,7 @@ namespace GitSharp.Core.Merge
             // have to close the last conflict here
             if (lastConflictingName != null)
             {
+				@out.Write('\n');
                 @out.Write((">>>>>>> " + lastConflictingName + "\n").getBytes(charsetName));
             }
         }
