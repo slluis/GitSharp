@@ -31,6 +31,10 @@ using System.Collections.Generic;
 using System.Collections;
 using GitSharp.Core;
 using System.Text;
+using GitSharp.Core.Merge;
+using GitSharp.Core.TreeWalk;
+using GitSharp.Core.Diff;
+using GitSharp.Core.DirectoryCache;
 
 namespace GitSharp
 {
@@ -65,8 +69,11 @@ namespace GitSharp
 			this.PrevStashCommitId = prevStashCommitId;
 			this.CommitId = commitId;
 			this.Author = author;
-			this.Comment = comment;
 			this.DateTime = DateTimeOffset.Now;
+			
+			// Skip "WIP on master: "
+			int i = comment.IndexOf (':');
+			this.Comment = comment.Substring (i + 2);			
 			
 			// Create the text line to be written in the stash log
 			
@@ -112,6 +119,9 @@ namespace GitSharp
 				string st = t.ToString ("yyyy-MM-ddTHH:mm:ss") + line.Substring (i + 1, 3) + ":" + line.Substring (i + 4, 2);
 				s.DateTime = DateTimeOffset.Parse (st);
 				s.Comment = line.Substring (i + 7);
+				i = s.Comment.IndexOf (':');
+				if (i != -1)
+					s.Comment = s.Comment.Substring (i + 2);			
 			}
 			s.FullLine = line;
 			return s;
@@ -157,7 +167,7 @@ namespace GitSharp
 			var parent = _repo.CurrentBranch.CurrentCommit;
 			Author author = new Author(_repo.Config["user.name"] ?? "unknown", _repo.Config["user.email"] ?? "unknown@(none).");
 			
-			if (message == null) {
+			if (string.IsNullOrEmpty (message)) {
 				// Use the commit summary as message
 				message = parent.ShortHash + " " + parent.Message;
 				int i = message.IndexOfAny (new char[] { '\r', '\n' });
@@ -227,15 +237,89 @@ namespace GitSharp
 		
 		internal void Apply (Stash stash)
 		{
-			// Restore the working tree
 			Commit wip = _repo.Get<Commit> (stash.CommitId);
-			wip.Checkout();
-			_repo._internal_repo.Index.write();
-			
-			// Restore the index
 			Commit index = wip.Parents.Last ();
-			_repo.Index.GitIndex.ReadTree (index.Tree.InternalTree);
-			_repo.Index.GitIndex.write ();
+			
+			Tree wipTree =  wip.Tree;
+			Tree headTree = _repo.CurrentBranch.CurrentCommit.Tree;
+			GitIndex currentIndex = _repo.Index.GitIndex;
+			Tree currentIndexTree = new Tree (_repo, _repo._internal_repo.MapTree (currentIndex.writeTree ()));
+			
+			WorkDirCheckout co = new WorkDirCheckout (_repo._internal_repo, _repo._internal_repo.WorkingDirectory, headTree.InternalTree, currentIndex, wip.Tree.InternalTree);
+			co.checkout ();
+			
+			currentIndex.write ();
+			
+			List<DirCacheEntry> toAdd = new List<DirCacheEntry> ();
+			
+			DirCache dc = DirCache.Lock (_repo._internal_repo);
+			try {
+				var cacheEditor = dc.editor ();
+				
+				// The WorkDirCheckout class doesn't check if there are conflicts in modified files,
+				// so we have to do it here.
+				
+				foreach (var c in co.Updated) {
+					
+					var baseEntry = wip.Parents.First ().Tree[c.Key] as Leaf;
+					var oursEntry = wipTree [c.Key] as Leaf;
+					var theirsEntry = headTree [c.Key] as Leaf;
+					
+					if (baseEntry != null && oursEntry != null && currentIndexTree [c.Key] == null) {
+						// If a file was reported as updated but that file is not present in the stashed index,
+						// it means that the file was scheduled to be deleted.
+						cacheEditor.@add (new DirCacheEditor.DeletePath (c.Key));
+						File.Delete (_repo.FromGitPath (c.Key));
+					}
+					else if (baseEntry != null && oursEntry != null && theirsEntry != null) {
+						MergeResult res = MergeAlgorithm.merge (new RawText (baseEntry.RawData), new RawText (oursEntry.RawData), new RawText (theirsEntry.RawData));
+						MergeFormatter f = new MergeFormatter ();
+						using (BinaryWriter bw = new BinaryWriter (File.OpenWrite (_repo.FromGitPath (c.Key)))) {
+							f.formatMerge (bw, res, "Base", "Stash", "Head", Constants.CHARSET.WebName);
+						}
+						if (res.containsConflicts ()) {
+							// Remove the entry from the index. It will be added later on.
+							cacheEditor.@add (new DirCacheEditor.DeletePath (c.Key));
+					
+							// Generate index entries for each merge stage
+							// Those entries can't be added right now to the index because a DirCacheEditor
+							// can't be used at the same time as a DirCacheBuilder.
+							var e = new DirCacheEntry(c.Key, DirCacheEntry.STAGE_1);
+							e.setObjectId (baseEntry.InternalEntry.Id);
+							e.setFileMode (baseEntry.InternalEntry.Mode);
+							toAdd.Add (e);
+							
+							e = new DirCacheEntry(c.Key, DirCacheEntry.STAGE_2);
+							e.setObjectId (oursEntry.InternalEntry.Id);
+							e.setFileMode (oursEntry.InternalEntry.Mode);
+							toAdd.Add (e);
+							
+							e = new DirCacheEntry(c.Key, DirCacheEntry.STAGE_3);
+							e.setObjectId (theirsEntry.InternalEntry.Id);
+							e.setFileMode (theirsEntry.InternalEntry.Mode);
+							toAdd.Add (e);
+						}
+					}
+				}
+				
+				cacheEditor.finish ();
+				
+				if (toAdd.Count > 0) {
+					// Add the index entries generated above
+					var cacheBuilder = dc.builder ();
+					for (int n=0; n<dc.getEntryCount (); n++)
+						cacheBuilder.@add (dc.getEntry (n));
+					foreach (var entry in toAdd)
+						cacheBuilder.@add (entry);
+					cacheBuilder.finish ();
+				}
+				
+				dc.write ();
+				dc.commit ();
+			} catch {
+				dc.unlock ();
+				throw;
+			}
 		}
 		
 		public void Remove (Stash s)
