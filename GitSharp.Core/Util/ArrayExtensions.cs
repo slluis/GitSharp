@@ -64,7 +64,7 @@ namespace GitSharp.Core.Util
 		/// <param name="value">the value to be stored in the specified range of elements of the array</param>
 		public static void Fill<T>(this T[] array, int fromIndex, int toIndex, T value)
 		{
-			for (int i = Math.Max(0, fromIndex); i < Math.Max(array.Length, toIndex); i++)
+			for (int i = Math.Max(0, fromIndex); i < Math.Min(array.Length, toIndex); i++)
 			{
 				array[i] = value;
 			}
